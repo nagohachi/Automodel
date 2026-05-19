@@ -186,12 +186,14 @@ def make_llava_onevision_dataset(
     return [format(example) for example in dataset]
 
 
-def make_cv17_dataset(path_or_dataset="ysdede/commonvoice_17_tr_fixed", split="train", **kwargs):
+def make_cv17_dataset(
+    path_or_dataset="ysdede/commonvoice_17_tr_fixed",
+    split="train",
+    streaming: bool = False,
+    **kwargs,
+):
     """Load and preprocess the CommonVoice 17 dataset for audio-to-text fine-tuning."""
-    dataset = load_dataset(path_or_dataset, split=split)
-    all_columns = dataset.column_names
-    columns_to_remove = [col for col in all_columns if col not in ["audio", "transcription"]]
-    dataset = dataset.remove_columns(columns_to_remove)
+    dataset = load_dataset(path_or_dataset, split=split, streaming=streaming)
 
     def format(example):
         return {
@@ -202,8 +204,92 @@ def make_cv17_dataset(path_or_dataset="ysdede/commonvoice_17_tr_fixed", split="t
             "audio": (example["audio"]["array"], example["audio"]["sampling_rate"]),
         }
 
-    ret = [format(example) for example in dataset]
-    return ret
+    if streaming:
+        return dataset.map(format, remove_columns=dataset.column_names)
+    all_columns = dataset.column_names
+    columns_to_remove = [col for col in all_columns if col not in ["audio", "transcription"]]
+    dataset = dataset.remove_columns(columns_to_remove)
+    return [format(example) for example in dataset]
+
+
+def make_cord_v2_phi4mm_dataset(
+    path_or_dataset="naver-clova-ix/cord-v2",
+    split="train",
+    streaming: bool = False,
+    max_image_dim: int = 448,
+    **kwargs,
+):
+    """CORD-V2 (receipt OCR) adapted for Phi-4-MM's flat-string image placeholder.
+
+    Same content as ``make_cord_v2_dataset`` (json2token target) but emits the
+    Phi-4-MM-shaped sample dict (flat user content with ``<|endoftext10|>`` plus
+    a top-level ``image`` field) that ``phi4_mm_image_collate_fn`` expects.
+
+    Args:
+        max_image_dim: longer-edge resize target. Phi-4-MM's HD transform produces
+            additional sub-tiles when either dimension exceeds the 448 base, and the
+            number of tiles grows roughly linearly with the longer edge. Resizing to
+            ``448`` keeps HD transform on the single-tile path → ~1024 visual tokens
+            per image instead of 7000+. Lossy for OCR detail but fits memory at
+            local_batch≥8 on 48 GB GPUs.
+    """
+    from PIL import Image as _PILImage
+
+    dataset = load_dataset(path_or_dataset, split=split, streaming=streaming)
+
+    def format(example):
+        ground_truth = json.loads(example["ground_truth"])
+        if "gt_parses" in ground_truth:
+            assert isinstance(ground_truth["gt_parses"], list)
+            gt_jsons = ground_truth["gt_parses"]
+        else:
+            assert "gt_parse" in ground_truth and isinstance(ground_truth["gt_parse"], dict)
+            gt_jsons = [ground_truth["gt_parse"]]
+        text = random.choice([json2token(gt_json, sort_json_key=True) for gt_json in gt_jsons])
+        img = example["image"]
+        if max_image_dim is not None and max(img.size) > max_image_dim:
+            img = img.copy()
+            img.thumbnail((max_image_dim, max_image_dim), _PILImage.Resampling.LANCZOS)
+        return {
+            "conversation": [
+                {"role": "user", "content": "<|endoftext10|>Extract the receipt content as JSON."},
+                {"role": "assistant", "content": text},
+            ],
+            "image": img,
+        }
+
+    if streaming:
+        return dataset.map(format, remove_columns=dataset.column_names)
+    return [format(example) for example in dataset]
+
+
+def make_rdr_phi4mm_dataset(
+    path_or_dataset="quintend/rdr-items",
+    split="train",
+    streaming: bool = False,
+    **kwargs,
+):
+    """RDR dataset adapted for Phi-4-MM's flat-string image-placeholder format.
+
+    Phi-4-MM uses ``<|endoftext10|>`` (token id 200010) as the image placeholder
+    inline in the user content, not the Qwen-style structured content list used by
+    ``make_rdr_dataset``. The collate_fn (``phi4_mm_image_collate_fn``) then passes
+    ``images=[PIL.Image, ...]`` to the processor alongside the chat-templated text.
+    """
+    dataset = load_dataset(path_or_dataset, split=split, streaming=streaming)
+
+    def format(example):
+        return {
+            "conversation": [
+                {"role": "user", "content": "<|endoftext10|>Describe this image."},
+                {"role": "assistant", "content": example["text"]},
+            ],
+            "image": example["image"],
+        }
+
+    if streaming:
+        return dataset.map(format, remove_columns=dataset.column_names)
+    return [format(example) for example in dataset]
 
 
 def make_unimm_chat_dataset(path_or_dataset="Yirany/UniMM-Chat", split="train", **kwargs):
