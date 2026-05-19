@@ -37,7 +37,7 @@ import wandb
 from huggingface_hub import constants as hf_constants
 from megatron_fsdp import MegatronFSDP
 from megatron_fsdp.fully_shard import fully_shard_optimizer
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
@@ -370,6 +370,43 @@ def build_dataloader(
             else:
                 ds = cfg_ds.instantiate()
 
+        is_streaming = isinstance(ds, IterableDataset)
+        if is_streaming:
+            # Per-rank sharding so each DP rank consumes a unique slice of the stream.
+            if device_mesh is not None:
+                from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
+
+                _dp_mesh = get_flat_mesh(device_mesh, "dp")
+                _dp_world_size = _dp_mesh.size()
+                _dp_rank = _dp_mesh.get_local_rank()
+            else:
+                _dp_world_size, _dp_rank = 1, 0
+            # Prefer split_dataset_by_node: it falls back to interleaved sample-skip
+            # when the underlying source has fewer file shards than dp_world_size
+            # (e.g. CORD-V2 / CV17 ship as 1-2 parquet files). Calling `.shard()`
+            # directly on such datasets raises IndexError inside HF's _merge_gen_kwargs.
+            from datasets.distributed import split_dataset_by_node
+
+            if hasattr(ds, "dataset"):
+                ds.dataset = split_dataset_by_node(ds.dataset, world_size=_dp_world_size, rank=_dp_rank)
+            else:
+                ds = split_dataset_by_node(ds, world_size=_dp_world_size, rank=_dp_rank)
+            logging.info(
+                f"VLM streaming: sharded for rank={_dp_rank}/{_dp_world_size}"
+            )
+            # Optional buffered shuffle. Pop from cfg_dl so it isn't forwarded to DataLoader.
+            _shuffle = cfg_dl.get("shuffle", False)
+            _shuffle_buffer_size = cfg_dl.get("shuffle_buffer_size", 10000)
+            if hasattr(cfg_dl, "shuffle"):
+                del cfg_dl.shuffle
+            if hasattr(cfg_dl, "shuffle_buffer_size"):
+                del cfg_dl.shuffle_buffer_size
+            if _shuffle and hasattr(ds, "shuffle"):
+                ds = ds.shuffle(buffer_size=_shuffle_buffer_size, seed=seed)
+                logging.info(
+                    f"VLM streaming: buffered shuffle buffer_size={_shuffle_buffer_size} seed={seed}"
+                )
+
         # Resolve packing config: top-level packed_sequence (LLM-style) takes
         # precedence over legacy dataset.packing (backward compat).
         if cfg_ps is not None:
@@ -383,6 +420,12 @@ def build_dataloader(
             packing_cfg = _legacy if _ps_enabled else None
             max_length = cfg_ds.get("max_length", None)
             pretokenize = cfg_ds.get("pretokenize", max_length is not None)
+
+        if pretokenize and is_streaming:
+            raise NotImplementedError(
+                "VLM streaming dataset is incompatible with pretokenize/packing; "
+                "set dataset.streaming=False or remove packed_sequence / max_length config."
+            )
 
         if pretokenize:
             from nemo_automodel.components.datasets.vlm.collate_fns import pad_collate_fn
@@ -440,14 +483,16 @@ def build_dataloader(
                 else:
                     collate_fn = lambda examples: pad_collate_fn(examples, processor)
 
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                ds,
-                **dist_sampler_kwargs,
+            sampler = (
+                None
+                if is_streaming
+                else torch.utils.data.distributed.DistributedSampler(ds, **dist_sampler_kwargs)
             )
         else:
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                ds,
-                **dist_sampler_kwargs,
+            sampler = (
+                None
+                if is_streaming
+                else torch.utils.data.distributed.DistributedSampler(ds, **dist_sampler_kwargs)
             )
             collate_cfg = cfg_dl.get("collate_fn", None)
             if collate_cfg:
@@ -465,9 +510,10 @@ def build_dataloader(
         if pp_n_microbatches is not None:
             collate_fn = wrap_vlm_collate_for_pp(collate_fn, n_microbatches=pp_n_microbatches)
 
-        return cfg_dl.instantiate(
-            dataset=ds, sampler=sampler, collate_fn=collate_fn, batch_size=local_batch_size
-        ), processor
+        dl_kwargs = {"dataset": ds, "collate_fn": collate_fn, "batch_size": local_batch_size}
+        if sampler is not None:
+            dl_kwargs["sampler"] = sampler
+        return cfg_dl.instantiate(**dl_kwargs), processor
 
 
 def build_distributed(cfg_dist: Dict[str, Any]) -> "DistInfo":  # noqa: F821
@@ -526,13 +572,19 @@ def build_lr_scheduler(cfg, optimizer, step_scheduler) -> list[OptimizerParamSch
 
     # Calculate total steps for the training run
     total_epochs = step_scheduler.num_epochs
-    epoch_len = len(step_scheduler.dataloader)
     grad_acc_steps = step_scheduler.grad_acc_steps
 
-    # Total optimizer steps (accounting for gradient accumulation)
-    total_steps = (total_epochs * epoch_len) // grad_acc_steps
-    if step_scheduler.max_steps is not None:
-        total_steps = min(total_steps, step_scheduler.max_steps)
+    # IterableDataset has no __len__; fall back to max_steps directly.
+    try:
+        epoch_len = len(step_scheduler.dataloader)
+        total_steps = (total_epochs * epoch_len) // grad_acc_steps
+        if step_scheduler.max_steps is not None:
+            total_steps = min(total_steps, step_scheduler.max_steps)
+    except (TypeError, NotImplementedError):
+        assert step_scheduler.max_steps is not None, (
+            "max_steps must be set when the training dataloader is unbounded (streaming)."
+        )
+        total_steps = step_scheduler.max_steps
 
     optimizer_param_schedulers = []
     user_kwargs = cfg.to_dict()
