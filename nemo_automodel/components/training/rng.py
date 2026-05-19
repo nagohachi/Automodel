@@ -79,7 +79,15 @@ def _restore_rng_state(state):
     random.setstate(state.random_rng_state)
     np.random.set_state(state.np_rng_state)
     torch.set_rng_state(state.torch_rng_state)
-    torch.cuda.set_rng_state_all(state.cuda_rng_state)
+    # cuda_rng_state is a list with one entry per GPU at save time. When resuming
+    # with fewer GPUs (e.g. world_size shrunk from 6 -> 5), set_rng_state_all
+    # would IndexError on torch.cuda.default_generators[i] for missing devices.
+    # Truncate to the current device count.
+    cuda_states = list(state.cuda_rng_state)
+    n_current = torch.cuda.device_count()
+    if len(cuda_states) > n_current:
+        cuda_states = cuda_states[:n_current]
+    torch.cuda.set_rng_state_all(cuda_states)
 
 
 class StatefulRNG:
